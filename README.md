@@ -61,6 +61,54 @@ card images. You supply the `BOOT.bin` from your own card; everything else is bu
 - CPU: stock Tezuka pins a core (classifier) and forks ~130 processes per status cycle. With the patches and classifier v2 the CPU metric
   idles at 11-17 (one busy core = 100), ~4 forks/s.
 
+## Build
+
+Host tools: `mkimage` (u-boot-tools), `dtc`, `xz`, `cpio`, `gcc`, `arm-linux-gnueabihf-gcc` (static libc), `python3` with `numpy scipy matplotlib` (tests only).
+The full walk-through with the reasons for each step is in [docs/BUILD.md](docs/BUILD.md); in short:
+
+```sh
+# 1. Copy BOOT.bin and uEnv.txt unchanged from the board's ORIGINAL SD card into vendor/ (keep the whole original card as a fallback).
+#    Do not regenerate BOOT.bin with bootgen: the 2026 build wrote zeros into the header and the board did not boot.
+
+# 2. Get a Tezuka fishball release (https://github.com/F5OEO/tezuka_fw/releases) or build it, and take from it:
+#    Image (raw, uncompressed kernel), system_top.bit (unzip tezuka.xsa), fishball devicetree.dtb, rootfs as uramdisk.image.gz
+
+# 3. Assemble the boot set
+mkdir -p set
+scripts/make-fit.sh Image system_top.bit set/uImage            # kernel + Maia bitstream in one FIT
+scripts/dtb-bootargs.sh fishball.dtb set/devicetree.dtb        # kernel command line goes in the device tree
+cp uramdisk.image.gz set/
+cp vendor/BOOT.bin vendor/uEnv.txt set/
+
+# 4. Build the classifier and add it to the ramdisk
+(cd classifier && ./build.sh)                                  # ./classifier = static ARM binary
+mkdir -p /tmp/ov/usr/bin && cp classifier/classifier /tmp/ov/usr/bin/
+scripts/patch-ramdisk.sh set/uramdisk.image.gz /tmp/ov set/uramdisk.image.gz "tezuka classifier v2"
+```
+
+## Write the SD card
+
+The card needs one FAT32 partition holding five files: `BOOT.bin`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz`, `uEnv.txt`.
+
+**Option A, format and write in one go** (erases the card; asks you to type `YES`; only accepts whole `mmcblk` devices of 64 GB or less):
+
+```sh
+lsblk                                         # find the card, e.g. /dev/mmcblk0 (check the size!)
+sudo scripts/write-sdcard.sh /dev/mmcblk0 set/
+```
+
+**Option B, copy onto a card that is already FAT32** (what I used for every update):
+
+```sh
+udisksctl mount -b /dev/mmcblk0p1             # mounts at /media/$USER/PLUTOBOOT
+cp set/* /media/$USER/PLUTOBOOT/
+sync && udisksctl unmount -b /dev/mmcblk0p1
+```
+
+Then put the card in the radio, set the boot-mode switch to SD, power on and open https://192.168.2.1 (use `http://` to see the temperature
+readouts). Check the files after writing with `cmp set/uImage /media/$USER/PLUTOBOOT/uImage` before unmounting if you want to be sure.
+If it does not boot, put the original vendor card contents back; the vendor `BOOT.bin` is never modified.
+
 ## Classifier v2
 
 Each second it averages the `/waterfall` frames, reads fc/fs from the Maia API, finds wide blocks (median filter + edge segmentation) and narrow
