@@ -20,6 +20,24 @@ the newer [Tezuka](https://github.com/F5OEO/tezuka_fw) features (Maia SDR spectr
 to the board, together with CPU fixes and a new signal classifier. Only the vendor FPGA bitstream and FSBL remain closed binaries; they are reused
 unchanged and replaced where possible by Maia's open bitstream.
 
+## Changes from upstream Tezuka
+
+Kernel, Maia SDR (maia-httpd, web UI, bitstream), Buildroot rootfs and the Dashboard are stock Tezuka v0.3.23 (Linux 6.12, fishball7010 target).
+What differs:
+
+- **Boot set for this board.** The vendor `BOOT.bin` is kept (its FSBL has this board's DDR/MIO setup). The kernel and Maia bitstream are packed in
+  one FIT `uImage` (uncompressed kernel, because the vendor U-Boot has no LZMA; FPGA loaded via `fpga@1`). The kernel command line, including
+  `uio_pdrv_genirq.of_id=uio_pdrv_genirq` and `maxcpus=2`, is set in the device tree's `/chosen`, since the vendor U-Boot ignores `setenv bootargs`.
+- **Hardware labels.** The device-tree model/labels say AD9363 / Zynq-7010 (the driver itself cannot tell AD936x parts apart).
+- **Signal classifier replaced.** Tezuka's template-matching classifier pinned one core. First rewritten as a fast equivalent
+  (`classifier-fast/`: prefix-sum matching with NEON, persistent MQTT pipe, no libwebsockets), then replaced by classifier v2 (`classifier/`),
+  a template-free emitter detector. The `state/classifier/*` topics the Dashboard reads are kept; `emitters`, `emitter_count`, `noise_floor_db`,
+  `center_hz` and `sample_rate_hz` are new. The Dashboard does not display the emitter list yet.
+- **CPU tuning of the status scripts** (`patches/`). `api_controller.sh` publishes only changed values (full refresh every 16 s), uses fork-free
+  sysfs/proc reads and cached `fw_printenv`, and computes slow-changing values less often; `watchconsoletx.sh` and `update.sh` no longer fork every
+  second. All 96 original topics are still published; `state/main/forks_per_s` is new.
+- **Result:** CPU metric 97 (stock classifier on) / 48-56 (classifier off) down to 11-17, and about 4 forks/s down from ~130 per status cycle.
+
 ## What is in here
 
 | Path | What |
