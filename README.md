@@ -45,7 +45,7 @@ What differs:
 | `classifier/` | **Classifier v2**: emitter detector/classifier (C, static ARM binary) with its Python reference spec, captures and tests |
 | `classifier-fast/` | Earlier optimised version of Tezuka's template classifier (kept for reference/comparison) |
 | `patches/` | CPU-tuning patches for Tezuka's `api_controller.sh`, `watchconsoletx.sh`, `update.sh` plus the test scripts used to measure them |
-| `scripts/` | Boot-set assembly: FIT image, device-tree bootargs, ramdisk overlay, SD card writer |
+| `scripts/` | `build-all.sh` (builds everything), plus the individual steps: FIT image, device-tree bootargs, ramdisk overlay, SD card writer |
 | `docs/BUILD.md` | Step-by-step build instructions |
 | `docs/NOTES.md` | Full project log: findings, pitfalls, measurements |
 | `reference/` | Decompiled vendor device tree |
@@ -63,28 +63,27 @@ card images. You supply the `BOOT.bin` from your own card; everything else is bu
 
 ## Build
 
-Host tools: `mkimage` (u-boot-tools), `dtc`, `xz`, `cpio`, `gcc`, `arm-linux-gnueabihf-gcc` (static libc), `python3` with `numpy scipy matplotlib` (tests only).
-The full walk-through with the reasons for each step is in [docs/BUILD.md](docs/BUILD.md); in short:
+One script builds the whole boot set. Inputs (nothing is downloaded for you):
+- `--vendor`: a folder with `BOOT.bin` and `uEnv.txt` copied **unchanged** from your board's original SD card (keep the original card as a fallback).
+  Do not regenerate `BOOT.bin` with bootgen: the 2026 build wrote zeros into the header and the board did not boot.
+- `--tezuka`: a Tezuka *fishball* release (zip or unpacked folder) from <https://github.com/F5OEO/tezuka_fw/releases>.
+- `--xsa`: `tezuka.xsa` of the fishball7010 board (in the tezuka_fw repository under `board/tezuka/fishball7010/bitstream/`), for the Maia bitstream.
 
 ```sh
-# 1. Copy BOOT.bin and uEnv.txt unchanged from the board's ORIGINAL SD card into vendor/ (keep the whole original card as a fallback).
-#    Do not regenerate BOOT.bin with bootgen: the 2026 build wrote zeros into the header and the board did not boot.
-
-# 2. Get a Tezuka fishball release (https://github.com/F5OEO/tezuka_fw/releases) or build it, and take from it:
-#    Image (raw, uncompressed kernel), system_top.bit (unzip tezuka.xsa), fishball devicetree.dtb, rootfs as uramdisk.image.gz
-
-# 3. Assemble the boot set
-mkdir -p set
-scripts/make-fit.sh Image system_top.bit set/uImage            # kernel + Maia bitstream in one FIT
-scripts/dtb-bootargs.sh fishball.dtb set/devicetree.dtb        # kernel command line goes in the device tree
-cp uramdisk.image.gz set/
-cp vendor/BOOT.bin vendor/uEnv.txt set/
-
-# 4. Build the classifier and add it to the ramdisk
-(cd classifier && ./build.sh)                                  # ./classifier = static ARM binary
-mkdir -p /tmp/ov/usr/bin && cp classifier/classifier /tmp/ov/usr/bin/
-scripts/patch-ramdisk.sh set/uramdisk.image.gz /tmp/ov set/uramdisk.image.gz "tezuka classifier v2"
+sudo apt install u-boot-tools device-tree-compiler xz-utils cpio unzip python3 gcc gcc-arm-linux-gnueabihf
+scripts/build-all.sh --vendor ~/original-card --tezuka tezuka-fishball-v0.3.23-*.zip --xsa tezuka.xsa
+# -> build/set/{BOOT.bin,uImage,devicetree.dtb,uramdisk.image.gz,uEnv.txt}   (about 20 seconds)
 ```
+
+What it does: packs the kernel (decompressed, the vendor U-Boot has no LZMA) and the Maia bitstream into one FIT `uImage`; puts the kernel command line
+and the AD9363 label into the device tree; fixes the Zynq-7010 / AD9363 labels in the dashboard and boot script; replaces the status scripts with the
+CPU-tuned versions (only if the stock files are the exact version the patches were written for, otherwise it says so and skips them); builds classifier
+v2 as a static ARM binary and adds everything to the ramdisk as an overlay. Options: `--out DIR`, `--no-tuning`, `--no-classifier`, `--write /dev/mmcblkN`
+(runs the SD card writer afterwards). Run it with `-h` for the full list. The individual steps are the scripts in `scripts/` (`make-fit.sh`,
+`dtb-bootargs.sh`, `patch-ramdisk.sh`) and are described in [docs/BUILD.md](docs/BUILD.md).
+
+Check: with the inputs above the result matches the `SDCARD-maia-v9` set that was tested on the radio (ramdisk files, device tree, FIT contents,
+`BOOT.bin`, `uEnv.txt`). `scripts/cpio-diff.py a.cpio b.cpio` compares two ramdisks file by file.
 
 ## Write the SD card
 
@@ -94,19 +93,19 @@ The card needs one FAT32 partition holding five files: `BOOT.bin`, `uImage`, `de
 
 ```sh
 lsblk                                         # find the card, e.g. /dev/mmcblk0 (check the size!)
-sudo scripts/write-sdcard.sh /dev/mmcblk0 set/
+sudo scripts/write-sdcard.sh /dev/mmcblk0 build/set/
 ```
 
 **Option B, copy onto a card that is already FAT32** (what I used for every update):
 
 ```sh
 udisksctl mount -b /dev/mmcblk0p1             # mounts at /media/$USER/PLUTOBOOT
-cp set/* /media/$USER/PLUTOBOOT/
+cp build/set/* /media/$USER/PLUTOBOOT/
 sync && udisksctl unmount -b /dev/mmcblk0p1
 ```
 
 Then put the card in the radio, set the boot-mode switch to SD, power on and open https://192.168.2.1 (use `http://` to see the temperature
-readouts). Check the files after writing with `cmp set/uImage /media/$USER/PLUTOBOOT/uImage` before unmounting if you want to be sure.
+readouts). Check the files after writing with `cmp build/set/uImage /media/$USER/PLUTOBOOT/uImage` before unmounting if you want to be sure.
 If it does not boot, put the original vendor card contents back; the vendor `BOOT.bin` is never modified.
 
 ## Classifier v2

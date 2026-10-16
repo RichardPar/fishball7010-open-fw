@@ -1,5 +1,7 @@
 # Build instructions
 
+`scripts/build-all.sh` performs all of the steps below in one go (see the README). This page explains each step and why it is done.
+
 Goal: an SD card boot set that runs Tezuka + Maia SDR on a Fishball-7010-class board with the optimised classifier.
 The card holds five files: `BOOT.bin`, `uImage`, `devicetree.dtb`, `uramdisk.image.gz`, `uEnv.txt`.
 

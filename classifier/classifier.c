@@ -315,7 +315,7 @@ static void analyze(spec_t *S)
     double *w = S->w;
     if (S->dc_artefact) { double a0 = w[c-4], a1 = w[c+4]; for (int i = 0; i < 7; i++) w[c-3+i] = a0 + (a1-a0)*i/6.0; }
     S->floor_db = percentile_of(w + lo, hi - lo, 2.0);
-    double *med25 = malloc((size_t)n*sizeof(double)), *res = malloc((size_t)n*sizeof(double)), *mad = malloc((size_t)n*sizeof(double));
+    double *med25 = malloc((size_t)n*sizeof(double)), *res = calloc((size_t)n, sizeof(double)), *mad = malloc((size_t)n*sizeof(double));
     median_filter_nearest(w, n, 25, med25);
     for (int i = 0; i < n; i++) res[i] = fabs(w[i] - med25[i]);
     median_filter_nearest(res, n, 201, mad);
@@ -499,13 +499,13 @@ static int g_aggregate = 1;
 static void aggregate_wifi(spec_t *s)
 {
     if (!g_aggregate) return;
-    int member[MAXEM] = {0}, ng = 0; int gstart[MAXEM], gcount[MAXEM];
+    int member[MAXEM] = {0}, ng = 0; int gcount[MAXEM];
     int last = -1;
     for (int i = 0; i < s->nem; i++) {
         emitter_t *e = &s->em[i];
         if (e->wide || !(band_flags(e->f_hz) & BF_ISM) || e->burst_db < 6.0 || !(e->cls == CLS_BURST || e->cls == CLS_UNK || e->cls == CLS_NARROW)) continue;
         if (last >= 0 && e->f_hz - s->em[last].f_hz <= 6e6) gcount[ng-1]++;
-        else { gstart[ng] = i; gcount[ng] = 1; ng++; }
+        else { gcount[ng] = 1; ng++; }
         member[i] = ng; last = i;
     }
     int drop[MAXEM] = {0}, any = 0;

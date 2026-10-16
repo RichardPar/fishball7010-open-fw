@@ -12,3 +12,4 @@ BOOT.bin
 *.bit.bin
 SDCARD*/
 work/
+build/
