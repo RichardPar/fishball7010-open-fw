@@ -1,6 +1,5 @@
 # build outputs
 classifier/classifier
-classifier/classifier.c
 classifier/classifier-native
 classifier/synth/
 classifier-fast/classifier
