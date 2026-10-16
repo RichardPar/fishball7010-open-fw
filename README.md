@@ -7,6 +7,15 @@ a working open stack and goes further: it runs the [Tezuka](https://github.com/F
 
 The board turned out to be a **Fishball 7010** clone (its FSBL MIO/DDR setup matches Tezuka's `fishball7010` target on all 46 MIO registers).
 
+## Why this exists
+
+The manufacturer of this board did not release the source code for its firmware, although it ships GPL software (Linux, U-Boot, Buildroot).
+So the shipped firmware was analysed instead: the boot files were extracted from the vendor SD card, the U-Boot and device tree were matched
+byte-for-byte against public sources, and the board was identified as a Fishball 7010 clone. With that, an open stack could be rebuilt and
+the newer [Tezuka](https://github.com/F5OEO/tezuka_fw) features (Maia SDR spectrum/waterfall web UI, Dashboard, MQTT status) were brought
+to the board, together with CPU fixes and a new signal classifier. Only the vendor FPGA bitstream and FSBL remain closed binaries; they are reused
+unchanged and replaced where possible by Maia's open bitstream.
+
 ## What is in here
 
 | Path | What |
