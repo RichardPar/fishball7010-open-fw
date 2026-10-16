@@ -1,0 +1,196 @@
+--- opt-notes/api_controller.original.sh	2026-10-16 18:23:03.531848851 +0100
++++ opt-notes/api_controller.optimised.sh	2026-10-16 18:23:03.531179119 +0100
+@@ -167,10 +167,18 @@
+ 
+ publish () {
+   local key="$1" val="$2"
++  # Polling loop only (DUMPING=1): every state/ message is retained, so an unchanged value need not be sent
++  # again. FORCE_REFRESH re-sends everything every few cycles (e.g. after a broker restart). Command handlers
++  # run in another process with DUMPING unset and keep the original always-publish behaviour.
++  if [ "$DUMPING" = 1 ] && [ "$FORCE_REFRESH" != 1 ] && [ "${CACHE[$key]+set}" = set ] && [ "${CACHE[$key]}" = "$val" ]; then
++    return 0
++  fi
+   mqtt_publish "$key" "$val"
+   if [ "${CACHE[$key]}" != "$val" ]; then
+     CACHE[$key]="$val"
+     serial_publish "$key" "$val"
++  elif [ "${CACHE[$key]+set}" != set ]; then
++    CACHE[$key]="$val"   # first (empty) value: remember it so the loop path can skip repeats
+   fi
+ }
+ 
+@@ -237,15 +245,63 @@
+ #  DATA PUBLISHING
+ # ============================================================
+ 
++# --- fork-light helpers (CPU optimisation) -------------------------------------------------
++# read_file_v: like read_file but returns the value in $RF without a subshell.
++read_file_v () {
++  if [ -r "$1" ]; then
++    RF=""
++    IFS= read -r -d '' RF < "$1" 2>/dev/null
++    RF=${RF%$'\n'}
++  else
++    RF='n/a'
++  fi
++}
++
++# fwenv_get: U-Boot environment value in $FWV, cached; fw_printenv reads the QSPI flash, so refresh at most
++# every FWENV_MAX dump cycles per variable.
++declare -A FWENV FWENV_AGE
++FWENV_MAX=15
++fwenv_get () {
++  local _n="$1"
++  if [ "${FWENV_AGE[$_n]:-$FWENV_MAX}" -ge "$FWENV_MAX" ]; then
++    FWENV[$_n]=$(fw_printenv -n "$_n" 2>/dev/null)
++    FWENV_AGE[$_n]=0
++  else
++    FWENV_AGE[$_n]=$(( FWENV_AGE[$_n] + 1 ))
++  fi
++  FWV=${FWENV[$_n]}
++}
++
++# reg_rd / reg_wr: IIO direct register access through debugfs (what iio_attr -D does), without starting
++# a libiio context. Falls back to iio_attr if the debugfs file is not writable.
++reg_rd () {  # $1 iio device dir, $2 register, $3 device name for the fallback
++  local _d=${1%/} _f
++  _f="/sys/kernel/debug/iio/${_d##*/}/direct_reg_access"
++  REGV=""
++  if [ -w "$_f" ]; then
++    { echo "$2" > "$_f"; } 2>/dev/null && read -r REGV < "$_f" 2>/dev/null && return 0
++  fi
++  REGV=$(iio_attr -D "$3" direct_reg_access "$2" 2>/dev/null)
++}
++reg_wr () {  # $1 iio device dir, $2 "register value", $3 device name for the fallback
++  local _d=${1%/} _f
++  _f="/sys/kernel/debug/iio/${_d##*/}/direct_reg_access"
++  if [ -w "$_f" ]; then
++    { echo "$2" > "$_f"; } 2>/dev/null && return 0
++  fi
++  iio_attr -D "$3" direct_reg_access "$2" >/dev/null 2>&1
++}
++
+ dump_data () {
+-  for K in "${!VMAP[@]}"; do publish "${VMAP[$K]}" "$(read_file "$K")"; done
+-  for K in "${!cVMAP[@]}"; do publish "${cVMAP[$K]}" "$(read_file "$K")"; done
++  for K in "${!VMAP[@]}"; do read_file_v "$K"; publish "${VMAP[$K]}" "$RF"; done
++  for K in "${!cVMAP[@]}"; do read_file_v "$K"; publish "${cVMAP[$K]}" "$RF"; done
+ 
+   publish "system/xo_correction" "$(read_file "${folder}xo_correction")"
+ 
+-  local _oc; _oc=$(fw_printenv overclock_profile 2>/dev/null | sed 's/overclock_profile=//')
++  local _oc; fwenv_get overclock_profile; _oc=$FWV
+   [ -n "$_oc" ] && publish "system/overclock" "$_oc"
+ 
++  if [ "$STATIC_DONE" != 1 ] || [ "$FORCE_REFRESH" = 1 ]; then
+   publish "main/serial"            "$(read_file /etc/serial)"
+   publish "main/hw_model"          "$(grep 'hw_model='          /etc/libiio.ini | sed 's,hw_model=,,')"
+   publish "main/fw_version"        "$(grep 'fw_version='        /etc/libiio.ini | sed 's,fw_version=,,')"
+@@ -259,17 +315,21 @@
+   local _fpga_ver;  _fpga_ver=$(grep '^fpga '     /opt/VERSIONS 2>/dev/null | cut -d' ' -f2)
+   [ -n "$_fpga_ver" ]    && publish "main/fpga"       "$_fpga_ver"
+   [ -n "$IIO_VERSION" ] && publish "main/iio" "$IIO_VERSION"
++    STATIC_DONE=1
++  fi
+ 
+   # Station identity — device is the source of truth (u-boot env), the
+   # Dashboard's Operator page reflects these instead of its own localStorage.
+-  publish "operator/name"     "$(fw_printenv -n operator_name 2>/dev/null)"
+-  publish "operator/callsign" "$(fw_printenv -n call          2>/dev/null)"
+-  publish "operator/locator"  "$(fw_printenv -n locator       2>/dev/null)"
++  fwenv_get operator_name; publish "operator/name"     "$FWV"
++  fwenv_get call;          publish "operator/callsign" "$FWV"
++  fwenv_get locator;       publish "operator/locator"  "$FWV"
+ 
+-  publish "vpn/enabled" "$([ "$(fw_printenv -n wireguard_enabled 2>/dev/null)" = "1" ] && echo on || echo off)"
++  fwenv_get wireguard_enabled
++  if [ "$FWV" = "1" ]; then publish "vpn/enabled" "on"; else publish "vpn/enabled" "off"; fi
+   publish_vpn_status
+ 
+-  publish "classifier/enabled" "$([ "$(fw_printenv -n classifier_enabled 2>/dev/null)" = "1" ] && echo on || echo off)"
++  fwenv_get classifier_enabled
++  if [ "$FWV" = "1" ]; then publish "classifier/enabled" "on"; else publish "classifier/enabled" "off"; fi
+ 
+   # Reference clock status. On boards with the vctcxo_lock IP (VCXO_BASE
+   # set at startup — see top of file), read real registers per
+@@ -311,7 +371,7 @@
+       publish "system/clkref/correction" "n/a"
+     fi
+   else
+-    local _clkref_src; _clkref_src=$(fw_printenv -n refclk_source 2>/dev/null)
++    local _clkref_src; fwenv_get refclk_source; _clkref_src=$FWV
+     _clkref_src=${_clkref_src:-internal}
+     publish "system/clkref/source"      "$_clkref_src"
+     if [ "$_clkref_src" = "external" ]; then
+@@ -324,6 +384,7 @@
+   fi
+ 
+   local _iface _cidr _prefix _mac _gw _dns
++  if [ "$FORCE_REFRESH" = 1 ] || [ $(( LOOP_N % 3 )) -eq 1 ]; then
+   publish "net/hostname" "$(hostname 2>/dev/null || echo 'n/a')"
+   _gw=$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')
+   publish "net/gateway" "${_gw:-n/a}"
+@@ -339,6 +400,7 @@
+     fi
+     [ -n "$_mac" ] && publish "net/$_iface/mac" "$_mac"
+   done
++  fi
+ 
+   # Handle Sweep Status Verification Safely
+   # Re-derive sweep state from LIVE signals only (hardware fastlock pin +
+@@ -382,11 +444,11 @@
+   publish "rx/buffer_size" "$(read_file "${adc_folder}buffer/length")"
+   publish "tx/buffer_size" "$(read_file "${dds_folder}buffer/length")"
+ 
+-  rx_overload=$(iio_attr -D ad9361-phy direct_reg_access 0x5E 2>/dev/null)
++  reg_rd "$folder" 0x5E ad9361-phy; rx_overload=$REGV
+   rx_overload=$((rx_overload & 1))
+   publish "rx/overload" "$rx_overload"
+ 
+-  tx_overload=$(iio_attr -D ad9361-phy direct_reg_access 0x5F 2>/dev/null)
++  reg_rd "$folder" 0x5F ad9361-phy; tx_overload=$REGV
+   if (( (tx_overload & 0x7C) != 0 )); then
+     publish "tx/overload" "1"
+   else
+@@ -438,10 +500,10 @@
+   fi
+   [ -n "$tx_dma_now" ] && TX_DMA_PREV=$tx_dma_now
+ 
+-  tx_under_raw=$(iio_attr -D cf-ad9361-dds-core-lpc direct_reg_access 0x80000088 2>/dev/null)
++  reg_rd "$dds_folder" 0x80000088 cf-ad9361-dds-core-lpc; tx_under_raw=$REGV
+   if [ -n "$tx_under_raw" ] && (( (tx_under_raw & 4) != 0 )) && (( tx_dma_rate > 0 )); then
+     publish "tx/underflow" "1"
+-    iio_attr -D cf-ad9361-dds-core-lpc direct_reg_access "0x80000088 $tx_under_raw" >/dev/null 2>&1
++    reg_wr "$dds_folder" "0x80000088 $tx_under_raw" cf-ad9361-dds-core-lpc
+   else
+     publish "tx/underflow" "0"
+   fi
+@@ -454,10 +516,10 @@
+   fi
+   [ -n "$rx_dma_now" ] && RX_DMA_PREV=$rx_dma_now
+ 
+-  rx_under_raw=$(iio_attr -D cf-ad9361-lpc direct_reg_access 0x80000088 2>/dev/null)
++  reg_rd "$adc_folder" 0x80000088 cf-ad9361-lpc; rx_under_raw=$REGV
+   if [ -n "$rx_under_raw" ] && (( (rx_under_raw & 4) != 0 )) && (( rx_dma_rate > 0 )); then
+     publish "rx/underflow" "1"
+-    iio_attr -D cf-ad9361-lpc direct_reg_access "0x80000088 $rx_under_raw" >/dev/null 2>&1
++    reg_wr "$adc_folder" "0x80000088 $rx_under_raw" cf-ad9361-lpc
+   else
+     publish "rx/underflow" "0"
+   fi
+@@ -1124,8 +1186,14 @@
+   done
+ ) &
+ 
+-# Poll dynamic data every 2 seconds
++# Poll dynamic data every 2 seconds. DUMPING / FORCE_REFRESH / LOOP_N are read by publish() and dump_data();
++# the command-handler subshell above was forked before they exist, so it keeps the original behaviour.
++DUMPING=0; FORCE_REFRESH=1; LOOP_N=0; STATIC_DONE=0
+ while true; do
++  LOOP_N=$(( LOOP_N + 1 ))
++  if [ $(( LOOP_N % 8 )) -eq 1 ]; then FORCE_REFRESH=1; else FORCE_REFRESH=0; fi
++  DUMPING=1
+   dump_data
++  DUMPING=0
+   sleep 2
+ done

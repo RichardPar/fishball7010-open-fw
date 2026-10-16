@@ -1,0 +1,1 @@
+{"name": "pmr446", "fc_hz": 446000000, "fs_hz": 5000000, "rf_bw_hz": 4000000, "gain_db": 69.0, "gain_mode": "SlowAttack", "floats_per_frame": 4096, "frames": 40, "fft_size": 4096}

@@ -1,0 +1,39 @@
+/dts-v1/;
+
+/ {
+	description = "Tezuka Maia (fishball 7010): Linux + FPGA bitstream";
+	#address-cells = <1>;
+
+	images {
+		fpga@1 {
+			description = "FPGA (Maia SDR, fishball7010)";
+			data = /incbin/("@BIT@");
+			type = "fpga";
+			arch = "arm";
+			compression = "none";
+			load = <0xF000000>;
+			hash@1 { algo = "md5"; };
+		};
+
+		linux_kernel@1 {
+			description = "Linux";
+			data = /incbin/("@IMAGE@");
+			type = "kernel";
+			arch = "arm";
+			os = "linux";
+			compression = "none";
+			load = <0x8000>;
+			entry = <0x8000>;
+			hash@1 { algo = "md5"; };
+		};
+	};
+
+	configurations {
+		default = "config@0";
+		config@0 {
+			description = "Linux with Maia FPGA";
+			kernel = "linux_kernel@1";
+			fpga = "fpga@1";
+		};
+	};
+};

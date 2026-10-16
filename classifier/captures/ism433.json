@@ -1,0 +1,1 @@
+{"name": "ism433", "fc_hz": 433900000, "fs_hz": 6000000, "rf_bw_hz": 4800000, "gain_db": 64.0, "gain_mode": "SlowAttack", "floats_per_frame": 4096, "frames": 40, "fft_size": 4096}

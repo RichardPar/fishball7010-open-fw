@@ -1,0 +1,57 @@
+--- opt-notes/watchconsoletx.original.sh	2026-10-16 19:33:00.904825055 +0100
++++ opt-notes/watchconsoletx.optimised.sh	2026-10-16 19:33:00.903585399 +0100
+@@ -133,23 +133,46 @@
+ 
+ pttoff
+ 
++# CPU: this loop runs every second, so it avoids forking. The interrupt count is read with shell builtins
++# (same value as: grep "7c42" /proc/interrupts | awk '{print $2 + $3}'), and the PTT register / LED / log
++# are only touched when the wanted state changes or something else moved the PTT LED away from it.
++read_tx_irq() {
++    CURRENT_COUNT=""
++    while read -r _l; do
++        case "$_l" in
++            *7c42*) set -- $_l; CURRENT_COUNT=$(( $2 + $3 )); break ;;
++        esac
++    done < /proc/interrupts
++}
++
+ # Initialize the history variable before starting the loop
+-LAST_COUNT=$(grep "7c42" /proc/interrupts | awk '{print $2 + $3}')
++read_tx_irq
++LAST_COUNT=$CURRENT_COUNT
++LAST_STATE=""
+ 
+ check_tx_flux() {
+   # Get the current absolute count immediately
+-    CURRENT_COUNT=$(grep "7c42" /proc/interrupts | awk '{print $2 + $3}')
+-    
++    read_tx_irq
++
+     # Compare it directly to the previous loop's count
+     DELTA=$((CURRENT_COUNT - LAST_COUNT))
+-    
++
+     # Save the current count as history for the NEXT loop execution
+     LAST_COUNT=$CURRENT_COUNT
+ 
+-    if [ "$DELTA" -gt 0 ]; then
+-        ptton
+-    else
+-        pttoff
++    if [ "$DELTA" -gt 0 ]; then WANT=1; else WANT=0; fi
++
++    PTT_NOW=""
++    read -r PTT_NOW < /sys/class/leds/ptt/brightness 2>/dev/null
++    if [ "$PTT_NOW" != "0" ]; then PTT_NOW=1; fi
++
++    if [ "$WANT" != "$LAST_STATE" ] || [ "$PTT_NOW" != "$WANT" ]; then
++        if [ "$WANT" = 1 ]; then
++            ptton
++        else
++            pttoff
++        fi
++        LAST_STATE=$WANT
+     fi
+ }
+ 

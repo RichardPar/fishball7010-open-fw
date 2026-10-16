@@ -1,0 +1,12 @@
+--- opt-notes/update.original.sh	2026-10-16 19:33:00.906489797 +0100
++++ opt-notes/update.optimised.sh	2026-10-16 19:33:00.905718047 +0100
+@@ -232,7 +232,8 @@
+ do
+  if [[ -r ${file} ]]
+   then
+-    lun=`cat $file`
++    lun=""
++    read -r lun < "$file" 2>/dev/null   # builtin: no fork (was: lun=`cat $file`)
+     if [ ${#lun} -eq 0 ]
+     then
+ 	do_reset=0

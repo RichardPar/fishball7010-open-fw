@@ -1,0 +1,27 @@
+Optimised Tezuka signal classifier (classifier.c, derived from tezuka_fw/app/classifier/classifier.c)
+
+Why: the stock daemon kept one Zynq-7010 core pinned (and the web UI slow). Per spectrum frame it
+ - slid each 512-bin template over the 4095-bin frame (3,584 positions per template) and at every position
+   copied the window, ran three double-precision normalisation passes and then a dot product (~27 M double
+   operations per correlation, 3 templates), and
+ - published ~12 values with system("mosquitto_pub ...") = a shell + a process + a new MQTT connection each.
+
+What changed
+ 1. classify(): window sum / sum-of-squares from prefix sums, so score = (dot(window,t) - mean*sum(t)) / sqrt(S2 - S1*mean)
+    with one NEON multiply-accumulate pass per position. Same maths as normalize()+cosine_sim().
+ 2. mqtt_pub(): one persistent `mqtt_pubd -n` pipe (not retained, like mosquitto_pub), falling back to the old
+    system() call if mqtt_pubd is missing or dies (retry every 10 s).
+ 3. WebSocket client: ~150-line native RFC 6455 client (fragmentation, ping/pong, close, reconnect) instead of
+    libwebsockets, so one static binary needs no matching library. Only numeric IPv4 / "localhost" hosts.
+ 4. SIGPIPE ignored; CLI options unchanged (-H -p -P -f -c -m -i -v -h).
+
+Verification (test/): old and new compiled into the same harness and fed 20 real frames from the radio's /waterfall
+plus 48 synthetic ones: identical template, offset and bandwidth on all 68; scores identical on real frames,
+within 1e-6 on synthetic. x86: 11-13x faster per correlation (13-17 ms -> 1.1-1.5 ms). The ARM static NEON build
+was also run under qemu-arm-static (same results) and against a local WebSocket server exercising fragmented
+messages with an interleaved ping, 16- and 64-bit lengths, text frames, malformed frames, pong and close.
+
+Build:   make            (arm-linux-gnueabihf-gcc, static, NEON)
+         make host-test  (x86 binary for the tests)
+Deploy:  replace /usr/bin/classifier in the ramdisk (SDCARD-maia-v7). The stock /etc/init.d/S61classifier is unchanged
+         and starts it when `fw_printenv classifier_enabled` is 1.

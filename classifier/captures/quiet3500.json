@@ -1,0 +1,1 @@
+{"name": "quiet3500", "fc_hz": 3500000002, "fs_hz": 30720000, "rf_bw_hz": 24576000, "gain_db": 71.0, "gain_mode": "SlowAttack", "floats_per_frame": 4096, "frames": 40, "fft_size": 4096}

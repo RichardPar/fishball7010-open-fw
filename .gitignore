@@ -1,0 +1,15 @@
+# build outputs
+classifier/classifier
+classifier/classifier.c
+classifier/classifier-native
+classifier/synth/
+classifier-fast/classifier
+*.pyc
+__pycache__/
+# vendor / third-party material is never committed
+BOOT.bin
+*.elf
+*.bit
+*.bit.bin
+SDCARD*/
+work/

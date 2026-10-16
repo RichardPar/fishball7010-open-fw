@@ -1,0 +1,1 @@
+{"name": "dab225", "fc_hz": 225599998, "fs_hz": 10000000, "rf_bw_hz": 8000000, "gain_db": 70.0, "gain_mode": "SlowAttack", "floats_per_frame": 4096, "frames": 40, "fft_size": 4096}

@@ -1,0 +1,1 @@
+{"name": "srd868", "fc_hz": 867999998, "fs_hz": 10000000, "rf_bw_hz": 8000000, "gain_db": 73.0, "gain_mode": "SlowAttack", "floats_per_frame": 4096, "frames": 40, "fft_size": 4096, "spectrometer_fps": 10.00576331967213, "integrations": 244}

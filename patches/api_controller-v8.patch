@@ -1,0 +1,394 @@
+--- opt-notes/api_controller.original.sh	2026-10-16 18:23:03.531848851 +0100
++++ opt-notes/api_controller.optimised-v8.sh	2026-10-16 19:33:00.902867433 +0100
+@@ -166,11 +166,18 @@
+ }
+ 
+ publish () {
++  # Polling loop only (DUMPING=1): every state/ message is retained, so an unchanged value need not be sent
++  # again. FORCE_REFRESH re-sends everything every few cycles (e.g. after a broker restart). Command handlers
++  # run in another process with DUMPING unset and keep the original always-publish behaviour.
++  # (One [[ ]] test: this function runs ~80 times per cycle, so every interpreted line counts.)
++  [[ $DUMPING == 1 && $FORCE_REFRESH != 1 && ${CACHE[$1]+set} == set && ${CACHE[$1]} == "$2" ]] && return 0
+   local key="$1" val="$2"
+   mqtt_publish "$key" "$val"
+   if [ "${CACHE[$key]}" != "$val" ]; then
+     CACHE[$key]="$val"
+     serial_publish "$key" "$val"
++  elif [ "${CACHE[$key]+set}" != set ]; then
++    CACHE[$key]="$val"   # first (empty) value: remember it so the loop path can skip repeats
+   fi
+ }
+ 
+@@ -220,7 +227,7 @@
+ # line we keep, field 2 (preshared-key) is explicitly discarded.
+ publish_vpn_status () {
+   local up=0 pubkey="" peer_pubkey="" endpoint="" allowed_ips="" handshake=0 rx=0 tx=0 _psk _keepalive
+-  if ip link show wg0 >/dev/null 2>&1; then
++  if [ -d /sys/class/net/wg0 ]; then
+     up=1
+     pubkey=$(wg show wg0 public-key 2>/dev/null)
+     read -r peer_pubkey _psk endpoint allowed_ips handshake rx tx _keepalive \
+@@ -237,15 +244,109 @@
+ #  DATA PUBLISHING
+ # ============================================================
+ 
++# --- fork-light helpers (CPU optimisation) -------------------------------------------------
++# read_file_v: like read_file but returns the value in $RF without a subshell.
++read_file_v () {
++  if [ -r "$1" ]; then
++    RF=""
++    IFS= read -r -d '' RF < "$1" 2>/dev/null
++    RF=${RF%$'\n'}
++  else
++    RF='n/a'
++  fi
++}
++
++# fwenv_get: U-Boot environment value in $FWV, cached; fw_printenv reads the QSPI flash, so refresh at most
++# every FWENV_MAX dump cycles per variable.
++declare -A FWENV FWENV_AGE
++FWENV_MAX=15
++fwenv_get () {
++  local _n="$1"
++  if [ "${FWENV_AGE[$_n]:-$FWENV_MAX}" -ge "$FWENV_MAX" ]; then
++    FWENV[$_n]=$(fw_printenv -n "$_n" 2>/dev/null)
++    FWENV_AGE[$_n]=0
++  else
++    FWENV_AGE[$_n]=$(( FWENV_AGE[$_n] + 1 ))
++  fi
++  FWV=${FWENV[$_n]}
++}
++
++# reg_rd / reg_wr: IIO direct register access through debugfs (what iio_attr -D does), without starting
++# a libiio context. Falls back to iio_attr if the debugfs file is not writable.
++reg_rd () {  # $1 iio device dir, $2 register, $3 device name for the fallback
++  local _d=${1%/} _f
++  _f="/sys/kernel/debug/iio/${_d##*/}/direct_reg_access"
++  REGV=""
++  if [ -w "$_f" ]; then
++    { echo "$2" > "$_f"; } 2>/dev/null && read -r REGV < "$_f" 2>/dev/null && return 0
++  fi
++  REGV=$(iio_attr -D "$3" direct_reg_access "$2" 2>/dev/null)
++}
++reg_wr () {  # $1 iio device dir, $2 "register value", $3 device name for the fallback
++  local _d=${1%/} _f
++  _f="/sys/kernel/debug/iio/${_d##*/}/direct_reg_access"
++  if [ -w "$_f" ]; then
++    { echo "$2" > "$_f"; } 2>/dev/null && return 0
++  fi
++  iio_attr -D "$3" direct_reg_access "$2" >/dev/null 2>&1
++}
++
++# read_opt: contents of a file, or "" if it is missing/unreadable (like `cat f 2>/dev/null`), in $RF, no fork.
++read_opt () {
++  RF=""
++  if [ -r "$1" ]; then IFS= read -r -d '' RF < "$1" 2>/dev/null; RF=${RF%$'\n'}; fi
++  return 0
++}
++
++# irq_sum PATTERN: sum of the all-digit fields after the first one on the first /proc/interrupts line that
++# contains PATTERN (what `grep PATTERN /proc/interrupts | head -1 | awk ...` computed), in $IRQSUM; "" if none.
++irq_sum () {
++  IRQSUM=""
++  local _l _f _i _s
++  while IFS= read -r _l; do
++    case $_l in
++      *"$1"*)
++        read -ra _f <<< "$_l"; _s=0
++        for (( _i=1; _i<${#_f[@]}; _i++ )); do
++          [[ ${_f[_i]} =~ ^[0-9]+$ ]] && _s=$(( _s + 10#${_f[_i]} ))
++        done
++        IRQSUM=$_s; return 0 ;;
++    esac
++  done < /proc/interrupts
++  return 0
++}
++
++# netdev_rxtx IFACE: fields 2 and 10 of the first /proc/net/dev line containing "IFACE:" in $NDRX / $NDTX.
++netdev_rxtx () {
++  NDRX=""; NDTX=""
++  local _l _f
++  while IFS= read -r _l; do
++    case $_l in
++      *"$1:"*) read -ra _f <<< "$_l"; NDRX=${_f[1]}; NDTX=${_f[9]}; return 0 ;;
++    esac
++  done < /proc/net/dev
++  return 0
++}
++
+ dump_data () {
+-  for K in "${!VMAP[@]}"; do publish "${VMAP[$K]}" "$(read_file "$K")"; done
+-  for K in "${!cVMAP[@]}"; do publish "${cVMAP[$K]}" "$(read_file "$K")"; done
++  local _pk
++  for K in "${!VMAP[@]}"; do
++    if [ -r "$K" ]; then RF=""; IFS= read -r -d '' RF < "$K" 2>/dev/null; RF=${RF%$'\n'}; else RF='n/a'; fi
++    _pk=${VMAP[$K]}
++    [[ $FORCE_REFRESH == 1 || ${CACHE[$_pk]+set} != set || ${CACHE[$_pk]} != "$RF" ]] && publish "$_pk" "$RF"
++  done
++  for K in "${!cVMAP[@]}"; do
++    if [ -r "$K" ]; then RF=""; IFS= read -r -d '' RF < "$K" 2>/dev/null; RF=${RF%$'\n'}; else RF='n/a'; fi
++    _pk=${cVMAP[$K]}
++    [[ $FORCE_REFRESH == 1 || ${CACHE[$_pk]+set} != set || ${CACHE[$_pk]} != "$RF" ]] && publish "$_pk" "$RF"
++  done
+ 
+-  publish "system/xo_correction" "$(read_file "${folder}xo_correction")"
++  read_file_v "${folder}xo_correction"; publish "system/xo_correction" "$RF"
+ 
+-  local _oc; _oc=$(fw_printenv overclock_profile 2>/dev/null | sed 's/overclock_profile=//')
++  local _oc; fwenv_get overclock_profile; _oc=$FWV
+   [ -n "$_oc" ] && publish "system/overclock" "$_oc"
+ 
++  if [ "$STATIC_DONE" != 1 ] || { [ "$FORCE_REFRESH" = 1 ] && [ $(( LOOP_N % 32 )) -eq 1 ]; }; then
+   publish "main/serial"            "$(read_file /etc/serial)"
+   publish "main/hw_model"          "$(grep 'hw_model='          /etc/libiio.ini | sed 's,hw_model=,,')"
+   publish "main/fw_version"        "$(grep 'fw_version='        /etc/libiio.ini | sed 's,fw_version=,,')"
+@@ -259,17 +360,21 @@
+   local _fpga_ver;  _fpga_ver=$(grep '^fpga '     /opt/VERSIONS 2>/dev/null | cut -d' ' -f2)
+   [ -n "$_fpga_ver" ]    && publish "main/fpga"       "$_fpga_ver"
+   [ -n "$IIO_VERSION" ] && publish "main/iio" "$IIO_VERSION"
++    STATIC_DONE=1
++  fi
+ 
+   # Station identity — device is the source of truth (u-boot env), the
+   # Dashboard's Operator page reflects these instead of its own localStorage.
+-  publish "operator/name"     "$(fw_printenv -n operator_name 2>/dev/null)"
+-  publish "operator/callsign" "$(fw_printenv -n call          2>/dev/null)"
+-  publish "operator/locator"  "$(fw_printenv -n locator       2>/dev/null)"
++  fwenv_get operator_name; publish "operator/name"     "$FWV"
++  fwenv_get call;          publish "operator/callsign" "$FWV"
++  fwenv_get locator;       publish "operator/locator"  "$FWV"
+ 
+-  publish "vpn/enabled" "$([ "$(fw_printenv -n wireguard_enabled 2>/dev/null)" = "1" ] && echo on || echo off)"
++  fwenv_get wireguard_enabled
++  if [ "$FWV" = "1" ]; then publish "vpn/enabled" "on"; else publish "vpn/enabled" "off"; fi
+   publish_vpn_status
+ 
+-  publish "classifier/enabled" "$([ "$(fw_printenv -n classifier_enabled 2>/dev/null)" = "1" ] && echo on || echo off)"
++  fwenv_get classifier_enabled
++  if [ "$FWV" = "1" ]; then publish "classifier/enabled" "on"; else publish "classifier/enabled" "off"; fi
+ 
+   # Reference clock status. On boards with the vctcxo_lock IP (VCXO_BASE
+   # set at startup — see top of file), read real registers per
+@@ -311,7 +416,7 @@
+       publish "system/clkref/correction" "n/a"
+     fi
+   else
+-    local _clkref_src; _clkref_src=$(fw_printenv -n refclk_source 2>/dev/null)
++    local _clkref_src; fwenv_get refclk_source; _clkref_src=$FWV
+     _clkref_src=${_clkref_src:-internal}
+     publish "system/clkref/source"      "$_clkref_src"
+     if [ "$_clkref_src" = "external" ]; then
+@@ -324,6 +429,21 @@
+   fi
+ 
+   local _iface _cidr _prefix _mac _gw _dns
++  # Network details (several ip/awk forks): recomputed only when link state, MAC or the routing table changed
++  # (cheap builtin reads), plus a full refresh every 32nd cycle.
++  local _sig="" _n _o _a _rt=""
++  for _n in usb0 eth0; do
++    if [ -d "/sys/class/net/$_n" ]; then
++      _o=""; _a=""
++      read -r _o < "/sys/class/net/$_n/operstate" 2>/dev/null
++      read -r _a < "/sys/class/net/$_n/address" 2>/dev/null
++      _sig="$_sig $_n:$_o:$_a"
++    fi
++  done
++  IFS= read -r -d '' _rt < /proc/net/route 2>/dev/null
++  _sig="$_sig|$_rt"
++  if [ "$_sig" != "$NET_SIG" ] || { [ "$FORCE_REFRESH" = 1 ] && [ $(( LOOP_N % 32 )) -eq 1 ]; }; then
++  NET_SIG=$_sig
+   publish "net/hostname" "$(hostname 2>/dev/null || echo 'n/a')"
+   _gw=$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')
+   publish "net/gateway" "${_gw:-n/a}"
+@@ -339,6 +459,7 @@
+     fi
+     [ -n "$_mac" ] && publish "net/$_iface/mac" "$_mac"
+   done
++  fi
+ 
+   # Handle Sweep Status Verification Safely
+   # Re-derive sweep state from LIVE signals only (hardware fastlock pin +
+@@ -347,10 +468,11 @@
+   # the sample rate back down via cmd/rx/sampling (which doesn't touch this
+   # file) left it stuck at "1" forever, permanently skipping the sync branch
+   # below and leaving state/rx/span stuck at the old high value.
+-  local sweep_hw; sweep_hw=$(cat "${debug_folder}adi,rx-fastlock-pincontrol-enable" 2>/dev/null)
+-  local s_freq; s_freq=$(cat /tmp/sweep_frequency 2>/dev/null)
+-  local s_span; s_span=$(cat /tmp/sweep_span 2>/dev/null)
+-  local hw_sr; hw_sr=$(read_file "${folder}in_voltage_sampling_frequency")
++  local sweep_hw s_freq s_span hw_sr
++  read_opt "${debug_folder}adi,rx-fastlock-pincontrol-enable"; sweep_hw=$RF
++  read_opt /tmp/sweep_frequency; s_freq=$RF
++  read_opt /tmp/sweep_span; s_span=$RF
++  read_file_v "${folder}in_voltage_sampling_frequency"; hw_sr=$RF
+ 
+   if [ "$sweep_hw" == "1" ] || { [ "$hw_sr" != "n/a" ] && [ "${hw_sr:-0}" -gt "43000000" ]; }; then
+     publish "rx/sweep/engaged" "1"
+@@ -377,16 +499,17 @@
+   publish "rx/sweep/frequency" "${s_freq:-0}"
+   publish "rx/span"            "${s_span:-0}"
+   publish "rx/sweep/span"      "${s_span:-0}"
+-  publish "main/fir_config"    "$(head -1 "${folder}filter_fir_config" 2>/dev/null || echo 'n/a')"
++  if [ -r "${folder}filter_fir_config" ]; then IFS= read -r RF < "${folder}filter_fir_config" 2>/dev/null || true; else RF='n/a'; fi
++  publish "main/fir_config"    "$RF"
+ 
+-  publish "rx/buffer_size" "$(read_file "${adc_folder}buffer/length")"
+-  publish "tx/buffer_size" "$(read_file "${dds_folder}buffer/length")"
++  read_file_v "${adc_folder}buffer/length"; publish "rx/buffer_size" "$RF"
++  read_file_v "${dds_folder}buffer/length"; publish "tx/buffer_size" "$RF"
+ 
+-  rx_overload=$(iio_attr -D ad9361-phy direct_reg_access 0x5E 2>/dev/null)
++  reg_rd "$folder" 0x5E ad9361-phy; rx_overload=$REGV
+   rx_overload=$((rx_overload & 1))
+   publish "rx/overload" "$rx_overload"
+ 
+-  tx_overload=$(iio_attr -D ad9361-phy direct_reg_access 0x5F 2>/dev/null)
++  reg_rd "$folder" 0x5F ad9361-phy; tx_overload=$REGV
+   if (( (tx_overload & 0x7C) != 0 )); then
+     publish "tx/overload" "1"
+   else
+@@ -417,12 +540,12 @@
+   done < /proc/meminfo
+   publish "main/mem" $(( (mem_total - mem_avail) * 100 / mem_total ))
+ 
+-  local temp_raw; temp_raw=$(read_file "${folder}in_temp0_input")
++  local temp_raw; read_file_v "${folder}in_temp0_input"; temp_raw=$RF
+   [ "$temp_raw" != "n/a" ] && publish "main/temp" $(( temp_raw / 1000 ))
+ 
+-  local fpga_raw; fpga_raw=$(read_file "${xadc_folder}in_temp0_input")
++  local fpga_raw; read_file_v "${xadc_folder}in_temp0_input"; fpga_raw=$RF
+   if [ "$fpga_raw" = "n/a" ] && [ -n "$xadc_folder" ] && [ "$xadc_folder" != "/" ]; then
+-    local xraw xoff; xraw=$(read_file "${xadc_folder}in_temp0_raw"); xoff=$(read_file "${xadc_folder}in_temp0_offset")
++    local xraw xoff; read_file_v "${xadc_folder}in_temp0_raw"; xraw=$RF; read_file_v "${xadc_folder}in_temp0_offset"; xoff=$RF
+     [ "$xraw" != "n/a" ] && fpga_raw=$(( (xraw + xoff) * 123 ))
+   fi
+   [ "$fpga_raw" != "n/a" ] && publish "main/fpga_temp" $(( fpga_raw / 1000 - 20 ))
+@@ -431,39 +554,39 @@
+   publish "main/uptime" "${uptime_s%%.*}"
+ 
+   local tx_dma_now tx_dma_rate=0
+-  tx_dma_now=$(grep "7c42" /proc/interrupts 2>/dev/null | head -1 | awk '{s=0; for(i=2;i<=NF;i++){if($i~/^[0-9]+$/)s+=$i}; print s}')
++  irq_sum 7c42; tx_dma_now=$IRQSUM
+   if [ -n "$tx_dma_now" ] && [ "$TX_DMA_PREV" -gt 0 ]; then
+     tx_dma_rate=$(( (tx_dma_now - TX_DMA_PREV) / 2 ))
+     publish "tx/dma_transfer" "$tx_dma_rate"
+   fi
+   [ -n "$tx_dma_now" ] && TX_DMA_PREV=$tx_dma_now
+ 
+-  tx_under_raw=$(iio_attr -D cf-ad9361-dds-core-lpc direct_reg_access 0x80000088 2>/dev/null)
++  reg_rd "$dds_folder" 0x80000088 cf-ad9361-dds-core-lpc; tx_under_raw=$REGV
+   if [ -n "$tx_under_raw" ] && (( (tx_under_raw & 4) != 0 )) && (( tx_dma_rate > 0 )); then
+     publish "tx/underflow" "1"
+-    iio_attr -D cf-ad9361-dds-core-lpc direct_reg_access "0x80000088 $tx_under_raw" >/dev/null 2>&1
++    reg_wr "$dds_folder" "0x80000088 $tx_under_raw" cf-ad9361-dds-core-lpc
+   else
+     publish "tx/underflow" "0"
+   fi
+ 
+   local rx_dma_now rx_dma_rate=0
+-  rx_dma_now=$(grep "7c40" /proc/interrupts 2>/dev/null | head -1 | awk '{s=0; for(i=2;i<=NF;i++){if($i~/^[0-9]+$/)s+=$i}; print s}')
++  irq_sum 7c40; rx_dma_now=$IRQSUM
+   if [ -n "$rx_dma_now" ] && [ "$RX_DMA_PREV" -gt 0 ]; then
+     rx_dma_rate=$(( (rx_dma_now - RX_DMA_PREV) / 2 ))
+     publish "rx/dma_transfer" "$rx_dma_rate"
+   fi
+   [ -n "$rx_dma_now" ] && RX_DMA_PREV=$rx_dma_now
+ 
+-  rx_under_raw=$(iio_attr -D cf-ad9361-lpc direct_reg_access 0x80000088 2>/dev/null)
++  reg_rd "$adc_folder" 0x80000088 cf-ad9361-lpc; rx_under_raw=$REGV
+   if [ -n "$rx_under_raw" ] && (( (rx_under_raw & 4) != 0 )) && (( rx_dma_rate > 0 )); then
+     publish "rx/underflow" "1"
+-    iio_attr -D cf-ad9361-lpc direct_reg_access "0x80000088 $rx_under_raw" >/dev/null 2>&1
++    reg_wr "$adc_folder" "0x80000088 $rx_under_raw" cf-ad9361-lpc
+   else
+     publish "rx/underflow" "0"
+   fi
+ 
+   local iq_rx iq_tx
+-  read -r iq_rx iq_tx <<< "$(grep "${IQ_IFF}:" /proc/net/dev 2>/dev/null | awk '{print $2, $10}')"
++  netdev_rxtx "${IQ_IFF}"; iq_rx=$NDRX; iq_tx=$NDTX
+   if [ -n "$iq_rx" ]; then
+     if [ "$IQ_INIT" -eq 1 ]; then
+       publish "rx/rate" $(( (iq_rx - IQ_RX_PREV) / 2 ))
+@@ -475,7 +598,7 @@
+   fi
+ 
+   local usb_rx usb_tx
+-  read -r usb_rx usb_tx <<< "$(grep "usb0:" /proc/net/dev 2>/dev/null | awk '{print $2, $10}')"
++  netdev_rxtx usb0; usb_rx=$NDRX; usb_tx=$NDTX
+   if [ -n "$usb_rx" ]; then
+     if [ "$USB_INIT" -eq 1 ]; then
+       publish "usb/rx_rate" $(( (usb_rx - USB_RX_PREV) / 2 ))
+@@ -486,7 +609,10 @@
+     USB_INIT=1
+   fi
+ 
+-  if pgrep iio_ws_proxy >/dev/null 2>&1; then
++  if [ "$FORCE_REFRESH" = 1 ] || [ $(( LOOP_N % 3 )) -eq 1 ]; then
++    if pgrep iio_ws_proxy >/dev/null 2>&1; then WSP_ON=1; else WSP_ON=0; fi
++  fi
++  if [ "$WSP_ON" = 1 ]; then
+     publish "system/iqtape" "on"
+     publish "system/siggen" "on"
+   else
+@@ -495,15 +621,18 @@
+   fi
+ 
+   # GPS fix and Maidenhead locator — poll via gpsd every 5 cycles (~10 s)
+-  if pidof gpsd >/dev/null 2>&1 && command -v gpspipe >/dev/null 2>&1; then
++  if [ "$FORCE_REFRESH" = 1 ] || [ $(( LOOP_N % 5 )) -eq 1 ]; then
++    if pidof gpsd >/dev/null 2>&1 && command -v gpspipe >/dev/null 2>&1; then GPS_OK=1; else GPS_OK=0; fi
++  fi
++  if [ "$GPS_OK" = 1 ]; then
+     GPS_TICK=$(( GPS_TICK + 1 ))
+     [ $(( GPS_TICK % 5 )) -eq 1 ] && poll_gps &
+   else
+     printf 'none' > /tmp/gps_fix
+   fi
+   local _gfix _gloc
+-  _gfix=$(cat /tmp/gps_fix 2>/dev/null)
+-  _gloc=$(cat /tmp/gps_locator 2>/dev/null)
++  read_opt /tmp/gps_fix; _gfix=$RF
++  read_opt /tmp/gps_locator; _gloc=$RF
+   publish "system/gps/fix" "${_gfix:-none}"
+   [ -n "$_gloc" ] && publish "system/gps/locator" "$_gloc"
+ 
+@@ -515,9 +644,20 @@
+   local _led_dir _led
+   for _led_dir in /sys/class/leds/*/; do
+     [ -d "$_led_dir" ] || continue
+-    _led=$(basename "$_led_dir")
+-    publish "gpio/$_led" "$(led_state "$_led")"
++    _led=${_led_dir%/}; _led=${_led##*/}
++    read_file_v "/sys/class/leds/$_led/brightness"
++    if [ "$RF" != "n/a" ] && [ "$RF" -gt 0 ] 2>/dev/null; then publish "gpio/$_led" "1"; else publish "gpio/$_led" "0"; fi
+   done
++
++  # Fork churn (new processes per second), published so CPU tuning can be checked over MQTT.
++  local _k _v _rest _forks=""
++  while read -r _k _v _rest; do
++    if [ "$_k" = processes ]; then _forks=$_v; break; fi
++  done < /proc/stat
++  if [ -n "$_forks" ]; then
++    [ "${FORKS_PREV:-0}" -gt 0 ] && publish "main/forks_per_s" $(( (_forks - FORKS_PREV) / 2 ))
++    FORKS_PREV=$_forks
++  fi
+ }
+ 
+ do_sweep_stop () {
+@@ -1124,8 +1264,14 @@
+   done
+ ) &
+ 
+-# Poll dynamic data every 2 seconds
++# Poll dynamic data every 2 seconds. DUMPING / FORCE_REFRESH / LOOP_N are read by publish() and dump_data();
++# the command-handler subshell above was forked before they exist, so it keeps the original behaviour.
++DUMPING=0; FORCE_REFRESH=1; LOOP_N=0; STATIC_DONE=0; WSP_ON=0; GPS_OK=0; FORKS_PREV=0; NET_SIG="@"
+ while true; do
++  LOOP_N=$(( LOOP_N + 1 ))
++  if [ $(( LOOP_N % 8 )) -eq 1 ]; then FORCE_REFRESH=1; else FORCE_REFRESH=0; fi
++  DUMPING=1
+   dump_data
++  DUMPING=0
+   sleep 2
+ done

@@ -1,0 +1,1 @@
+{"name": "gsm940", "fc_hz": 940000000, "fs_hz": 30720000, "rf_bw_hz": 24576000, "gain_db": 49.0, "gain_mode": "SlowAttack", "floats_per_frame": 4096, "frames": 40, "fft_size": 4096, "spectrometer_fps": 10.0, "integrations": 750}
